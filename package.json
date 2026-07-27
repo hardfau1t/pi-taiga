@@ -1,0 +1,34 @@
+{
+  "name": "@hardfau1t/pi-taiga-manager",
+  "version": "1.0.0",
+  "description": "A Pi Coding Agent extension for managing Taiga project management tool via REST API. Supports issues, tasks, milestones, and team collaboration features.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hardfau1t/pi-taiga.git"
+  },
+  "keywords": [
+    "pi-package",
+    "taiga"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/hardfau1t/pi-taiga/issues"
+  },
+  "homepage": "https://github.com/hardfau1t/pi-taiga#readme",
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
