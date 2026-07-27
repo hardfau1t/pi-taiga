@@ -128,22 +128,9 @@ async function httpCall<T>(
   // URL: Start with provided url. If it fails with HTML (frontend), try stripping port or swapping to 8001.
   let currentUrl = urlStr;
   let urlStrategies: string[] = [currentUrl];
-  
-  const maxRetries = authStrategies.length * urlStrategies.length;
   let attempts = 0;
 
-  while (attempts < maxRetries) {
-    // Check if we need to fix the URL (if previous attempt returned HTML/Frontend error)
-    const prevError = attempts > 0 ? 'HTML' : null; 
-    // Note: We don't strictly know the previous error here easily unless we parse it. 
-    // Instead, let's just iterate auth strategies first for the current URL to be faster, 
-    // then handle URL correction if those fail with non-JSON errors.
-
-    // Actually, simpler logic:
-    // 1. Loop through Auth Strategies for currentUrl.
-    // 2. If we get HTML response (Frontend), fix URL and restart loop.
-    // 3. If we get "Invalid token" and have more auth strategies, retry.
-    
+  while (true) {
     const u = parseUrl(currentUrl);
     log(`[REQUEST] ${attempts + 1}: ${method} ${currentUrl}`);
 
@@ -169,10 +156,8 @@ async function httpCall<T>(
         continue; // Try next auth strategy
       }
       
-      // If we got a non-HTML error and we're on port 9000, also try URL variants
-      if (urlStrategies.length === 1 && !urlCorrected && currentUrl.includes(':9000')) {
-        urlCorrected = true;
-        
+      // If we got an error and we're on port 9000, also try URL variants
+      if (urlStrategies.length === 1 && currentUrl.includes(':9000')) {
         // Strategy: Strip :9000 (nginx proxy)
         let fixedUrl = currentUrl.replace(/:9000/, '');
         log(`[URL] Also trying ${fixedUrl} (stripped :9000)`);
@@ -184,24 +169,18 @@ async function httpCall<T>(
         urlStrategies.unshift(fixedUrl);
       }
       
-      // Real error or exhausted strategies
-      return result;
-    }
-    
-    // If we are here, we either ran out of auth strategies or had an HTML response
-    // Move to next URL strategy
-    if (urlStrategies.length > 1) {
-      currentUrl = urlStrategies.pop()!;
-      attempts++;
-      log(`[URL] Next attempt on ${currentUrl}`);
-      continue;
-    } else {
-      // No more URLs to try
-      break;
+      // Exhausted all auth strategies for this URL — try next URL if available
+      if (urlStrategies.length > 1) {
+        currentUrl = urlStrategies.pop()!;
+        attempts++;
+        log(`[URL] Next attempt on ${currentUrl}`);
+        break; // restart outer loop with new URL, reset auth iteration
+      } else {
+        // No more URLs or auth strategies to try — return last error
+        return result;
+      }
     }
   }
-
-  return result || { error: 'Maximum retries reached', ok: false };
 }
 
 // ------------------------------------------------------------------
@@ -335,11 +314,13 @@ export async function login(
   password: string,
   authType?: string,
 ): Promise<{ ok: true; data: AuthResponse } | HttpError> {
-  let apiUrl = getApiBaseUrl(config);
-  log(`[LOGIN] Attempting to ${apiUrl}/auth`);
+  let baseUrl = getApiBaseUrl(config);
+  // Remove trailing slash for auth endpoint
+  if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
+  const url = `${baseUrl}/auth`;
+  log(`[LOGIN] Attempting to ${url}`);
   
-  const url = `${apiUrl}/auth`;
-  const bodyObj = { type: authType || 'normal', username, password };
+  const bodyObj = { type: authType || 'ldap', username, password };
 
   const result = await httpCall<{ auth_token: string; user: AuthResponse['user'] }>('POST', url, undefined, bodyObj);
   
@@ -352,7 +333,7 @@ export async function login(
   };
 
   config.authToken = authResp.auth_token;
-  config.baseUrl = apiUrl.replace('/api/v1/', ''); // Store base URL without /api/v1/ for relative usage
+  config.baseUrl = baseUrl.replace('/api/v1/', ''); // Store base URL without /api/v1/ for relative usage
   
   log(`[LOGIN] Success! Token length: ${authResp.auth_token?.length}`);
   return { ok: true, data: authResp };

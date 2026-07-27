@@ -57,7 +57,7 @@ function loadConfigFromSession(ctx: ReturnType<ExtensionAPI>["sessionManager"]):
 //            4) interactive prompt
 // --------------------------------------------------------------------------
 
-async function ensureAuth(configStore: Record<string, unknown>, ctx: any): Promise<TaigaConfig> {
+async function ensureAuth(configStore: Record<string, unknown>, ctx: any, authStore: Record<string, unknown>): Promise<TaigaConfig> {
   let cfg = makeConfig(configStore);
 
   // Priority 1: already have a token in memory
@@ -70,6 +70,9 @@ async function ensureAuth(configStore: Record<string, unknown>, ctx: any): Promi
       configStore["authToken"] = sessionCfg.authToken;
       configStore["username"] = sessionCfg.username ?? "";
       configStore["password"] = sessionCfg.password ?? "";
+      authStore["authToken"] = sessionCfg.authToken;
+      authStore["username"] = sessionCfg.username ?? "";
+      authStore["baseUrl"] = sessionCfg.baseUrl;
       return makeConfig(configStore);
     }
   }
@@ -115,50 +118,13 @@ async function ensureAuth(configStore: Record<string, unknown>, ctx: any): Promi
   }
 
   configStore["authToken"] = result.data.auth_token;
+  authStore["authToken"] = result.data.auth_token;
   return makeConfig(configStore);
 }
 
-// --------------------------------------------------------------------------
-// Formatting helpers
-// --------------------------------------------------------------------------
 
-function formatUser(u: TaigaUser): string {
-  const name = u.full_name_display || "-";
-  const handle = u.username;
-  return `• **#${u.id}** ${name} (@${handle})`;
-}
 
-function formatProject(p: TaigaProject): string {
-  return `• **#[${p.slug}]** ${p.name} (id=${p.id})`;
-}
 
-function formatStatus(s: TaigaStatus): string {
-  const closed = s.is_closed ? "✅" : "🔵";
-  return `• **[${s.color.padEnd(7)}]** ${closed} ${s.name}`;
-}
-
-function taskRow(t: TaigaTask): string {
-  const status = t.status_extra_info?.name || "?";
-  const assignee = t.assigned_to_extra_info
-    ? `${t.assigned_to_extra_info.full_name_display} (@${t.assigned_to_extra_info.username})`
-    : "unassigned";
-  return `**#${t.ref}** — [${status}] ${t.subject}\n  Assignee: ${assignee} | Comments: ${t.total_comments}`;
-}
-
-function issueRow(i: TaigaIssue): string {
-  const status = i.status_extra_info?.name || "?";
-  const assignee = i.assigned_to_extra_info
-    ? `${i.assigned_to_extra_info.full_name_display} (@${i.assigned_to_extra_info.username})`
-    : "unassigned";
-  const issueType = i.issue_type_extra_info?.name || "?";
-  const priority = i.priority_extra_info?.name || "?";
-  return `**#${i.ref}** — [${status}] ${i.subject}\n  Assignee: ${assignee} | Type: ${issueType} | Priority: ${priority}`;
-}
-
-function renderList<T>(items: T[], rowFn: (item: T) => string): string {
-  if (!items.length) return "_No results._";
-  return items.map(rowFn).join("\n");
-}
 
 // --------------------------------------------------------------------------
 // Extension factory
@@ -168,68 +134,82 @@ export default function (pi: ExtensionAPI) {
   // Auth state carried across tool calls via details persistence
   let authStore: Record<string, unknown> = {};
 
-  // ---- session_start: load config, auto-login, and print summary widget ----
+  // --------------------------------------------------------------------------
+  // Helper functions for rendering lists and formatting entries
+  // --------------------------------------------------------------------------
+
+  function renderList<T>(items: T[], formatter: (item: T) => string): string {
+    if (!items.length) return "_No items found._";
+    const lines = items.map(formatter);
+    return lines.join("\n")
+      .replace(/^/gm, "• ");
+  }
+
+  function formatProject(p: TaigaProject): string {
+    return `**#${p.id}** ${p.name} (slug: \`${p.slug}\`)`;
+  }
+
+  function formatStatus(s: TaigaStatus): string {
+    return `[${s.color.padEnd(7)}] ${s.name}${s.is_closed ? " (closed)" : ""}`;
+  }
+
+  function taskRow(t: TaigaTask): string {
+    const status = t.status_extra_info;
+    const assignee = t.assigned_to_extra_info
+      ? ` → ${t.assigned_to_extra_info.full_name_display}`
+      : " (unassigned)";
+    return `**#${t.ref}** [${status?.color}] ${status?.name}\`$${t.subject.substring(0, 60)}\`${t.subject.length > 60 ? "…" : ""}]${assignee}`;
+  }
+
+  function issueRow(t: TaigaIssue): string {
+    const status = t.status_extra_info;
+    const assignee = t.assigned_to_extra_info
+      ? ` → ${t.assigned_to_extra_info.full_name_display}`
+      : " (unassigned)";
+    return `**#${t.ref}** [${status?.color}] ${status?.name}\`$${t.subject.substring(0, 60)}\`${t.subject.length > 60 ? "…" : ""}]${assignee}`;
+  }
+
+  function formatUser(u: TaigaUser): string {
+    return `**#${u.id}** ${u.full_name_display} (@${u.username})`;
+  }
+
+  // ---- session_start: load config and print status widget (lazy auth) ----
+  // Note: we deliberately avoid calling api.login() here. Authentication is
+  // deferred until the first taiga_* tool call, which uses ensureAuth() to
+  // authenticate on demand (once per session via the authStore closure).
   pi.on("session_start", async (_event, ctx) => {
-    let authToken = null;
-    let username = "(not set)";
     let displayName = "(none)";
     let baseUrl = "https://api.taiga.io/api/v1";
     let authMethod = "none";
 
-    // 1) Session persistence (token from earlier tool call)
+    // 1) Session persistence (token from earlier tool call in this session)
     const loaded = loadConfigFromSession(ctx.sessionManager);
     if (loaded.authToken) {
-      authToken = loaded.authToken;
       baseUrl = loaded.baseUrl;
-      username = loaded.username ?? "(not set)";
-      displayName = username;
+      displayName = loaded.username ?? "(not set)";
       authMethod = "session";
-      // Restore into authStore so subsequent tools find the token
+      // Restore into authStore so subsequent tools find the token immediately
       authStore["authToken"] = loaded.authToken;
       authStore["username"] = loaded.username ?? "";
       authStore["baseUrl"] = loaded.baseUrl;
     }
 
-    // 2) Environment variables (override session if present)
+    // 2) Environment variables status (for display only)
     const envUser = process.env.TAIGA_USER;
     const envPass = process.env.TAIGA_PASSWORD;
     const envBaseUrl = process.env.TAIGA_BASE_URL;
-    const envAuthType = process.env.TAIGA_AUTH_TYPE;
     baseUrl = envBaseUrl || baseUrl;
 
-    // 3) Auto-login via env vars
-    if (envUser && envPass) {
-      authStore["baseUrl"] = baseUrl;
-      const result = await api.login({ baseUrl }, envUser, envPass, envAuthType || "normal");
-      if (!result.ok) {
-        ctx.ui.notify(
-          `Taiga manager - env login failed: ${result.error}. Call taiga_login to retry.`,
-          "warning",
-        );
-        authMethod = "env (failed)";
-        displayName = envUser;
-      } else {
-        // Defensive: Taiga instances may return varying response structures
-        const data = result.data || {};
-        authToken = data.auth_token || null;
-        const userObj = data.user || { username: envUser, full_name_display: envUser };
-        username = userObj.username || envUser;
-        displayName = userObj.full_name_display || userObj.username || envUser;
-        authStore["authToken"] = authToken;
-        authStore["username"] = envUser;
-        if (authToken) {
-          authMethod = "env OK";
-        } else {
-          // Login returned 200 but no token — unusual, treat as partial success
-          ctx.ui.notify(
-            `Taiga manager - login returned 200 but no auth_token. Response: ${JSON.stringify(data).substring(0, 100)}`,
-            "warning",
-          );
-          authMethod = "env (no token)";
-        }
-      }
-    } else if (!authToken) {
-      // No env vars and no session - warn
+    // 3) Determine auth method and status
+    if (authMethod === "session") {
+      // Already authenticated via session persistence — no need to check env vars
+      authMethod = "session";
+    } else if (envUser && envPass) {
+      // Env vars are available but login is deferred to first tool call
+      displayName = envUser;
+      authMethod = "env (ready, lazy)";
+    } else if (!loaded.authToken) {
+      // No session token and no env vars — warn user
       ctx.ui.notify(
         "Taiga manager loaded - no TAIGA_USER/TAIGA_PASSWORD set. Call taiga_login to authenticate.",
         "warning",
@@ -237,12 +217,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     // --- Display config info widget above editor ---
-    const maskedPass = envPass ? envPass.slice(0, 2) + "-".repeat(Math.max(envPass.length - 2, 1)) : "(not set)";
-    const isLoggedIn = !!authToken;
+    const isLoggedIn = !!authStore["authToken"];
     
     if (isLoggedIn) {
       ctx.ui.notify(`Taiga Manager — OK Authenticated (${authMethod})\nUser: ${displayName}\nURL: ${baseUrl || '(default)'}`, "info");
-    } else {
+    } else if (!envUser || !envPass) {
+      // Only warn if env vars aren't available (if they are, we're ready to lazy-auth)
       ctx.ui.notify(`Taiga Manager — Not logged in (${authMethod})`, "warning");
     }
   });
@@ -261,6 +241,12 @@ export default function (pi: ExtensionAPI) {
       "Call taiga_login to verify or trigger the login; subsequent taiga_* tools auto-inherit the token.",
     ],
     async execute() {
+      // Already authenticated in this session — skip redundant login
+      if (authStore["authToken"]) {
+        const user = authStore["username"] || "current user";
+        return { content: [{ type: "text", text: `✅ Already authenticated as **${user}** (@${user}). No re-authentication needed.` }] };
+      }
+
       const envUser = process.env.TAIGA_USER;
       const envPass = process.env.TAIGA_PASSWORD;
 
@@ -302,7 +288,7 @@ export default function (pi: ExtensionAPI) {
       const hasToken = !!authStore["authToken"];
       const user = authStore["username"] || "(not logged in)";
       const url = (authStore["baseUrl"] as string) || "https://api.taiga.io/api/v1";
-      const envSource = process.env.TAIGA_USER ? "env vars" : "prompt";
+      const envSource = process.env.TAIGA_USER ? "env vars (ready)" : "no creds set";
       return {
         content: [{ type: "text", text: `Auth: ${hasToken ? "✅ token stored" : "❌ no token"}\nUser: ${user}\nURL: ${url}\nSource: ${envSource}` }],
         details: {},
@@ -320,7 +306,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     promptSnippet: "Show current authenticated Taiga user profile",
     async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getMe(cfg);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -347,7 +333,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     promptSnippet: "List Taiga projects the current user is a member of",
     async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listProjects(cfg);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -374,7 +360,7 @@ export default function (pi: ExtensionAPI) {
       slug: Type.String({ description: "Project slug (e.g., 'my-project')" }),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getProjectBySlug(cfg, params.slug);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -401,7 +387,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "List task statuses for a Taiga project",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listTaskStatuses(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -429,7 +415,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "List issue statuses for a Taiga project",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listIssueStatuses(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -456,7 +442,7 @@ export default function (pi: ExtensionAPI) {
       projectId: Type.Number({ description: "Project ID" }),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listIssueTypes(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -483,7 +469,7 @@ export default function (pi: ExtensionAPI) {
       projectId: Type.Number({ description: "Project ID" }),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listPriorities(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -510,7 +496,7 @@ export default function (pi: ExtensionAPI) {
       projectId: Type.Number({ description: "Project ID" }),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listSeverities(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -537,7 +523,7 @@ export default function (pi: ExtensionAPI) {
       projectId: Type.Number({ description: "Project ID" }),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.listMilestones(cfg, params.projectId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -577,7 +563,7 @@ export default function (pi: ExtensionAPI) {
       "Use taiga_list_task_statuses first to get valid status IDs.",
     ],
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const filters: Record<string, unknown> = { project: params.projectId };
       if (params.statusId) filters.status = params.statusId;
       if (params.assignedTo !== undefined) filters.assigned_to = params.assignedTo;
@@ -612,7 +598,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Get full details of a single Taiga task",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getTask(cfg, params.taskId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -688,7 +674,7 @@ export default function (pi: ExtensionAPI) {
       "Pass statusId from taiga_list_task_statuses; pass milestoneId from taiga_list_milestones.",
     ],
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // Confirm before creating
       const confirmed = await confirmWrite(
@@ -754,7 +740,7 @@ export default function (pi: ExtensionAPI) {
       "Only include fields you want to update; unchanged fields are left as-is.",
     ],
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // Confirm before updating task status/assignee/etc.
       const changedFields = Object.keys(params).filter(k => k !== "taskId");
@@ -808,7 +794,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Delete a Taiga task permanently (requires confirmation)",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // First get the task name for confirmation display
       const getResult = await api.getTask(cfg, params.taskId);
@@ -854,7 +840,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "List and filter issues in a Taiga project",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const filters: Record<string, unknown> = { project: params.projectId };
       if (params.statusId) filters.status = params.statusId;
       if (params.typeId) filters.type = params.typeId;
@@ -890,7 +876,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Get full details of a single Taiga issue",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getIssue(cfg, params.issueId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -943,7 +929,7 @@ export default function (pi: ExtensionAPI) {
       "Check taiga_list_issue_types and taiga_list_priorities for valid IDs.",
     ],
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // Confirm before creating issue
       const confirmMsg = `Project: ${params.projectId}\nSubject: ${params.subject}`;
@@ -1007,7 +993,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Update a Taiga issue (partial patch, requires confirmation)",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // Confirm before updating issue
       const changedFields = Object.keys(params).filter(k => k !== "issueId");
@@ -1059,7 +1045,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Delete a Taiga issue permanently (requires confirmation)",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // First get the issue name for confirmation display
       const getResult = await api.getIssue(cfg, params.issueId);
@@ -1107,7 +1093,7 @@ export default function (pi: ExtensionAPI) {
       "Set isPrivate=true if the comment should only be visible to team members.",
     ],
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       const hasTask = params.taskId !== undefined;
       const hasIssue = params.issueId !== undefined;
@@ -1188,7 +1174,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "View comment history of a Taiga task",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getTaskHistory(cfg, params.taskId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -1223,7 +1209,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "View comment history of a Taiga issue",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
       const result = await api.getIssueHistory(cfg, params.issueId);
       if (!result.ok) return { content: [{ type: "text", text: `❌ Error: ${result.error}` }] };
 
@@ -1258,7 +1244,7 @@ export default function (pi: ExtensionAPI) {
       action: StringEnum(["watch", "unwatch"] as const),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       let result;
       if (params.action === "watch") {
@@ -1290,7 +1276,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Search across Taiga tasks, issues, epics, etc.",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       const filterParams = params.projectId ? { project: params.projectId } : undefined;
       const result = await api.search(cfg, params.query, filterParams);
@@ -1330,7 +1316,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Assign a task or issue to yourself",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       // Get current user
       const meResult = await api.getMe(cfg);
@@ -1379,7 +1365,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "List Taiga users for finding assignee IDs",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       let result;
       if (params.projectId) {
@@ -1416,7 +1402,7 @@ export default function (pi: ExtensionAPI) {
     }),
     promptSnippet: "Update the status of a Taiga task or issue",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = await ensureAuth(authStore, ctx);
+      const cfg = await ensureAuth(authStore, ctx, authStore);
 
       const hasTask = params.taskId !== undefined;
       const hasIssue = params.issueId !== undefined;
