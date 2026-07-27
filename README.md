@@ -17,6 +17,14 @@ A Pi Coding Agent extension for managing Taiga project management tool via REST 
 
 ## Installation
 
+### Via `pi install` (recommended)
+
+```bash
+pi install git:github.com/hardfau1t/pi-taiga.git
+```
+
+### Manual Installation
+
 1. Copy this folder to your Pi agent extensions directory:
    ```bash
    cp -r taiga-manager ~/.pi/agent/extensions/
